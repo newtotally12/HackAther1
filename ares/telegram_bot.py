@@ -2341,6 +2341,8 @@ async def async_main() -> None:
         finally:
             await store.close()
             await snapshot_store.close()
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
