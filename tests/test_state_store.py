@@ -177,6 +177,7 @@ async def test_concurrent_state_saves_are_serialized(tmp_path, monkeypatch) -> N
     finally:
         await store.close()
 
+
 @pytest.mark.asyncio
 async def test_state_from_another_repository_starts_fresh_and_is_replaced(tmp_path) -> None:
     import json
