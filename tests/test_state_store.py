@@ -176,3 +176,70 @@ async def test_concurrent_state_saves_are_serialized(tmp_path, monkeypatch) -> N
         assert store.remote_sha == "remote-sha-2"
     finally:
         await store.close()
+
+@pytest.mark.asyncio
+async def test_state_from_another_repository_starts_fresh_and_is_replaced(tmp_path) -> None:
+    import json
+    from base64 import b64decode, b64encode
+
+    import httpx
+
+    from ares.crypto import decrypt_state, encrypt_state
+    from ares.state_store import DEFAULT_STATE
+
+    current_token = "fork-bot-token"
+    current_repository = "newtotally12/HackAther1"
+    admin_id = 123
+    inherited = encrypt_state(
+        {"providers": {"legacy": {"api_key": "must-not-carry-over"}}},
+        bot_token=current_token,
+        repository="Aryasamadi/HackAther",
+        admin_id=admin_id,
+    )
+    saved_payloads: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/contents/.ares/state.enc"):
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "inherited-state-sha",
+                    "encoding": "base64",
+                    "content": b64encode(inherited).decode("ascii"),
+                },
+            )
+        if request.method == "PUT" and request.url.path.endswith("/contents/.ares/state.enc"):
+            body = json.loads(request.content)
+            assert body["sha"] == "inherited-state-sha"
+            fresh_payload = b64decode(body["content"])
+            assert decrypt_state(
+                fresh_payload,
+                bot_token=current_token,
+                repository=current_repository,
+                admin_id=admin_id,
+            ) == DEFAULT_STATE
+            saved_payloads.append(fresh_payload)
+            return httpx.Response(200, json={"content": {"sha": "fresh-state-sha"}})
+        return httpx.Response(404)
+
+    store = StateStore(
+        bot_token=current_token,
+        admin_id=admin_id,
+        repository=current_repository,
+        github_token="test-github-token",
+        branch="main",
+        local_path=str(tmp_path / "state.enc"),
+    )
+    await store._client.aclose()
+    store._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        loaded = await store.load()
+        assert loaded == DEFAULT_STATE
+        assert store.recovered_from_invalid_key is True
+        assert store.remote_sha == "inherited-state-sha"
+
+        await store.save(loaded)
+        assert len(saved_payloads) == 1
+        assert store.remote_sha == "fresh-state-sha"
+    finally:
+        await store.close()
