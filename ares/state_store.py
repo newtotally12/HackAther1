@@ -4,12 +4,17 @@ import asyncio
 import base64
 import binascii
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 import httpx
+from cryptography.exceptions import InvalidTag
 
 from ares.crypto import decrypt_state, encrypt_state
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_STATE: dict[str, Any] = {
@@ -54,6 +59,8 @@ class StateStore:
         self.branch = branch
         self.local_path = Path(local_path)
         self.remote_sha: str | None = None
+        # Set when an existing encrypted file belongs to different credentials/repository.
+        self.recovered_from_invalid_key = False
         # Serialize all writes from Telegram callbacks, polling, monitors and shutdown.
         self._save_lock = asyncio.Lock()
         self._client = httpx.AsyncClient(timeout=25)
@@ -164,7 +171,19 @@ class StateStore:
             encrypted = self.local_path.read_bytes()
         if encrypted is None:
             return json.loads(json.dumps(DEFAULT_STATE))
-        loaded = self._decrypt(encrypted)
+        try:
+            loaded = self._decrypt(encrypted)
+        except InvalidTag:
+            # A copied state file is bound to its original bot/repository/admin identity.
+            # When it cannot be authenticated, start clean instead of crashing before
+            # Telegram can come up. Keep remote_sha so the first save replaces that file.
+            self.recovered_from_invalid_key = True
+            logger.warning(
+                "Existing encrypted ARES state does not match this deployment's "
+                "credentials or repository; starting with an empty state. The old "
+                "ciphertext will be replaced by the first successful state save."
+            )
+            return json.loads(json.dumps(DEFAULT_STATE))
         state = json.loads(json.dumps(DEFAULT_STATE))
         state.update(loaded)
         return state

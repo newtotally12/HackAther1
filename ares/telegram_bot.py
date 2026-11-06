@@ -2223,45 +2223,6 @@ async def async_main() -> None:
         github_token=config.github_token,
         branch=config.github_ref,
     )
-
-    # Prefer durable repository storage. API/authentication errors are fatal:
-    # only an actual missing release may fall back to the legacy Actions artifact.
-    remote_restored = await snapshot_store.restore(remote_snapshot_path)
-    history_recovery_gap = False
-    if remote_restored:
-        restore_snapshot(
-            remote_snapshot_path,
-            Path("."),
-            bot_token=config.telegram_token,
-            repository=config.github_repository,
-            admin_id=config.admin_id,
-        )
-        remote_snapshot_path.replace(snapshot_path)
-        logger.info("Restored durable encrypted Strix history from repository storage")
-    else:
-        restored = restore_snapshot(
-            snapshot_path,
-            Path("."),
-            bot_token=config.telegram_token,
-            repository=config.github_repository,
-            admin_id=config.admin_id,
-        )
-        if restored:
-            logger.info("Restored Strix history from the legacy Actions artifact")
-        else:
-            previous_runtime_exists = (
-                os.environ.get("ARES_PREVIOUS_RUNTIME_EXISTS", "false").lower() == "true"
-            )
-            if previous_runtime_exists:
-                history_recovery_gap = True
-                logger.error(
-                    "Previous runtime exists but no Strix snapshot survived the old "
-                    "artifact-only retention window. Starting with an explicit recovery "
-                    "gap marker; no previous scan will be auto-resumed."
-                )
-            else:
-                logger.info("No previous Strix history exists; starting with an empty history")
-
     store = StateStore(
         bot_token=config.telegram_token,
         admin_id=config.admin_id,
@@ -2272,14 +2233,77 @@ async def async_main() -> None:
     )
     state: dict[str, Any] | None = None
     try:
+        # Load ARES settings first. If the encrypted state belongs to the source
+        # repository, deliberately skip every legacy/durable Strix restore so this
+        # Fork starts with no inherited settings, scans, or auto-resume markers.
         state = await store.load()
+        fresh_state_reset = store.recovered_from_invalid_key
+        history_recovery_gap = False
+
+        if fresh_state_reset:
+            logger.warning(
+                "Fork identity mismatch detected: inherited Strix snapshots are being "
+                "ignored and this deployment will initialize with empty history."
+            )
+        else:
+            # Prefer durable repository storage. API/authentication errors are fatal:
+            # only an actual missing release may fall back to the legacy Actions artifact.
+            remote_restored = await snapshot_store.restore(remote_snapshot_path)
+            if remote_restored:
+                restore_snapshot(
+                    remote_snapshot_path,
+                    Path("."),
+                    bot_token=config.telegram_token,
+                    repository=config.github_repository,
+                    admin_id=config.admin_id,
+                )
+                remote_snapshot_path.replace(snapshot_path)
+                logger.info("Restored durable encrypted Strix history from repository storage")
+            else:
+                restored = restore_snapshot(
+                    snapshot_path,
+                    Path("."),
+                    bot_token=config.telegram_token,
+                    repository=config.github_repository,
+                    admin_id=config.admin_id,
+                )
+                if restored:
+                    logger.info("Restored Strix history from the legacy Actions artifact")
+                else:
+                    previous_runtime_exists = (
+                        os.environ.get("ARES_PREVIOUS_RUNTIME_EXISTS", "false").lower() == "true"
+                    )
+                    if previous_runtime_exists:
+                        history_recovery_gap = True
+                        logger.error(
+                            "Previous runtime exists but no Strix snapshot survived the old "
+                            "artifact-only retention window. Starting with an explicit recovery "
+                            "gap marker; no previous scan will be auto-resumed."
+                        )
+                    else:
+                        logger.info("No previous Strix history exists; starting with an empty history")
+
         if history_recovery_gap:
             missing_run = ARESBot._mark_unavailable_history(state)
         else:
             missing_run = None
+
         bot = ARESBot(config, store, state, snapshot_store=snapshot_store)
         try:
-            if history_recovery_gap:
+            if fresh_state_reset:
+                # Establish a clean encrypted baseline before the first Telegram poll.
+                # This also prevents later scheduled handoffs from mistaking this fresh
+                # install for a deployment with missing historical scan data.
+                try:
+                    await bot._checkpoint_snapshot()
+                    await bot._save_state()
+                except Exception as exc:
+                    logger.exception("Could not establish the initial clean ARES baseline")
+                    raise RuntimeError(
+                        "ARES cannot start because its fresh encrypted state and "
+                        "empty Strix history baseline could not be committed."
+                    ) from exc
+            elif history_recovery_gap:
                 # Establish the first durable baseline before polling Telegram.
                 # If GitHub Release storage is unavailable, do not start an ephemeral worker.
                 try:
