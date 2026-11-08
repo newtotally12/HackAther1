@@ -2,16 +2,9 @@ name: ARES Telegram Runtime
 
 on:
   workflow_dispatch:
-  push:
-    branches: ["main"]
-    paths-ignore:
-      - ".ares/**"
-      - "ares-state/**"
-  schedule:
-    - cron: "*/5 * * * *"
 
-# New code deployments and manual restarts replace the previous worker.
-# Scheduled handoffs stay serialized and never cancel an active scheduled worker.
+# ARES runs only when explicitly started with workflow_dispatch.
+# Code pushes and scheduled events never start or replace the runtime.
 concurrency:
   group: ares-runtime-v2
   cancel-in-progress: ${{ github.event_name != 'schedule' }}
@@ -37,8 +30,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Stop previous ARES runtime on code deployment
-        if: github.event_name != 'schedule'
+      - name: Stop previous ARES runtime on manual start
+        if: github.event_name == 'workflow_dispatch'
         timeout-minutes: 2
         uses: actions/github-script@v7
         with:
